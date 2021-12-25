@@ -6,7 +6,7 @@
 *.lo
 *.o
 *.obj
-
+desktop.ini
 # Precompiled Headers
 *.gch
 *.pch
@@ -36,3 +36,4 @@ __pycache__
 
 # VS Code Workspace
 *.code-workspace
+*.ini

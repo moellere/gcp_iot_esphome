@@ -5,7 +5,17 @@
  *
  * Author: Enoch Moeller <enoch@tweektech.com>
  * Last Updated: 2021-12-18
- * License: MIT
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  * Requirements:
  * - https://github.com/moellere/gcp_iot_esphome
@@ -16,39 +26,45 @@
 using namespace esphome;
 
 /**
- * Create a new GCP_IoT object
+ * Create a new GCPIoT Esphome object
  *
  * Args:
- *   hw_serial: pointer to an Arduino HardwareSerial instance
+ *   project_id: id of the GCP project where the registry exists
+ *   location: 
+ *   registry_id: the id of the IoT Core registry
+ *   device_id: the id of the device itself
+ *   private_key: 
+ *     To get the private key run (where private-key.pem is the ec private key
+ *     used to create the certificate uploaded to google cloud iot):
+ *     openssl ec -in <private-key.pem> -noout -text
+ *     and copy priv: part.
+ *     The key length should be exactly the same as the key length bellow (32 pairs
+ *     of hex digits). If it's bigger and it starts with "00:" delete the "00:". If
+ *     it's smaller add "00:" to the start. If it's too big or too small something
+ *     is probably wrong with your key.
  *   poll_interval: polling interval in milliseconds
+ *   primary_ca: certificate for primary GCP CA
+ *   backup_ca: certificate for backup GCP CA
  */
-MitsubishiHeatPump::MitsubishiHeatPump(
-        HardwareSerial* hw_serial,
-        uint32_t poll_interval
+GCPIoTEsp::GCPIoTEsp(
+        char* project_id,
+        char* location,
+        char* registry_id,
+        char* device_id,
+        unsigned char private_key[],
+        uint32_t poll_interval,
+        const char* primary_ca,
+        const char* backup_ca
 ) :
     PollingComponent{poll_interval}, // member initializers list
     hw_serial_{hw_serial}
 {
     this->traits_.set_supports_action(true);
     this->traits_.set_supports_current_temperature(true);
-    this->traits_.set_supports_two_point_target_temperature(false);
-    this->traits_.set_visual_min_temperature(ESPMHP_MIN_TEMPERATURE);
-    this->traits_.set_visual_max_temperature(ESPMHP_MAX_TEMPERATURE);
-    this->traits_.set_visual_temperature_step(ESPMHP_TEMPERATURE_STEP);
 }
 
-void MitsubishiHeatPump::check_logger_conflict_() {
-#ifdef USE_LOGGER
-    if (this->get_hw_serial_() == logger::global_logger->get_hw_serial()) {
-        ESP_LOGW(TAG, "  You're using the same serial port for logging"
-                " and the MitsubishiHeatPump component. Please disable"
-                " logging over the serial port by setting"
-                " logger:baud_rate to 0.");
-    }
-#endif
-}
 
-void MitsubishiHeatPump::update() {
+void GCPIoTEsp::update() {
     // This will be called every "update_interval" milliseconds.
     //this->dump_config();
     this->hp->sync();
@@ -59,368 +75,25 @@ void MitsubishiHeatPump::update() {
 #endif
 }
 
-void MitsubishiHeatPump::set_baud_rate(int baud) {
-    this->baud_ = baud;
-}
-
 /**
- * Get our supported traits.
+ * Implement control of a GCP IoT Esphome device.
  *
- * Note:
- * Many of the following traits are only available in the 1.5.0 dev train of
- * ESPHome, particularly the Dry operation mode, and several of the fan modes.
- *
- * Returns:
- *   This class' supported climate::ClimateTraits.
+ * Maps HomeAssistant/ESPHome modes
  */
-climate::ClimateTraits MitsubishiHeatPump::traits() {
-    return traits_;
-}
-
-/**
- * Modify our supported traits.
- *
- * Returns:
- *   A reference to this class' supported climate::ClimateTraits.
- */
-climate::ClimateTraits& MitsubishiHeatPump::config_traits() {
-    return traits_;
-}
-
-/**
- * Implement control of a MitsubishiHeatPump.
- *
- * Maps HomeAssistant/ESPHome modes to Mitsubishi modes.
- */
-void MitsubishiHeatPump::control(const climate::ClimateCall &call) {
+void GCPIoTEsp::control(const char* &call) {
     ESP_LOGV(TAG, "Control called.");
 
-    bool updated = false;
-    bool has_mode = call.get_mode().has_value();
-    bool has_temp = call.get_target_temperature().has_value();
-    if (has_mode){
-        this->mode = *call.get_mode();
-    }
-    switch (this->mode) {
-        case climate::CLIMATE_MODE_COOL:
-            hp->setModeSetting("COOL");
-            hp->setPowerSetting("ON");
-
-            if (has_mode){
-                if (cool_setpoint.has_value() && !has_temp) {
-                    hp->setTemperature(cool_setpoint.value());
-                    this->target_temperature = cool_setpoint.value();
-                }
-                this->action = climate::CLIMATE_ACTION_IDLE;
-                updated = true;
-            }
-            break;
-        case climate::CLIMATE_MODE_HEAT:
-            hp->setModeSetting("HEAT");
-            hp->setPowerSetting("ON");
-            if (has_mode){
-                if (heat_setpoint.has_value() && !has_temp) {
-                    hp->setTemperature(heat_setpoint.value());
-                    this->target_temperature = heat_setpoint.value();
-                }
-                this->action = climate::CLIMATE_ACTION_IDLE;
-                updated = true;
-            }
-            break;
-        case climate::CLIMATE_MODE_DRY:
-            hp->setModeSetting("DRY");
-            hp->setPowerSetting("ON");
-            if (has_mode){
-                this->action = climate::CLIMATE_ACTION_DRYING;
-                updated = true;
-            }
-            break;
-        case climate::CLIMATE_MODE_HEAT_COOL:
-            hp->setModeSetting("AUTO");
-            hp->setPowerSetting("ON");
-            if (has_mode){
-                if (auto_setpoint.has_value() && !has_temp) {
-                    hp->setTemperature(auto_setpoint.value());
-                    this->target_temperature = auto_setpoint.value();
-                }
-                this->action = climate::CLIMATE_ACTION_IDLE;
-            }
-            updated = true;
-            break;
-        case climate::CLIMATE_MODE_FAN_ONLY:
-            hp->setModeSetting("FAN");
-            hp->setPowerSetting("ON");
-            if (has_mode){
-                this->action = climate::CLIMATE_ACTION_FAN;
-                updated = true;
-            }
-            break;
-        case climate::CLIMATE_MODE_OFF:
-        default:
-            if (has_mode){
-                hp->setPowerSetting("OFF");
-                this->action = climate::CLIMATE_ACTION_OFF;
-                updated = true;
-            }
-            break;
-    }
-
-    if (has_temp){
-        ESP_LOGV(
-            "control", "Sending target temp: %.1f",
-            *call.get_target_temperature()
-        );
-        hp->setTemperature(*call.get_target_temperature());
-        this->target_temperature = *call.get_target_temperature();
-        updated = true;
-    }
-
-    //const char* FAN_MAP[6]         = {"AUTO", "QUIET", "1", "2", "3", "4"};
-    if (call.get_fan_mode().has_value()) {
-        ESP_LOGV("control", "Requested fan mode is %s", *call.get_fan_mode());
-        this->fan_mode = *call.get_fan_mode();
-        switch(*call.get_fan_mode()) {
-            case climate::CLIMATE_FAN_OFF:
-                hp->setPowerSetting("OFF");
-                updated = true;
-                break;
-            case climate::CLIMATE_FAN_DIFFUSE:
-                hp->setFanSpeed("QUIET");
-                updated = true;
-                break;
-            case climate::CLIMATE_FAN_LOW:
-                hp->setFanSpeed("1");
-                updated = true;
-                break;
-            case climate::CLIMATE_FAN_MEDIUM:
-                hp->setFanSpeed("2");
-                updated = true;
-                break;
-            case climate::CLIMATE_FAN_MIDDLE:
-                hp->setFanSpeed("3");
-                updated = true;
-                break;
-            case climate::CLIMATE_FAN_HIGH:
-                hp->setFanSpeed("4");
-                updated = true;
-                break;
-            case climate::CLIMATE_FAN_ON:
-            case climate::CLIMATE_FAN_AUTO:
-            default:
-                hp->setFanSpeed("AUTO");
-                updated = true;
-                break;
-        }
-    }
-
-    //const char* VANE_MAP[7]        = {"AUTO", "1", "2", "3", "4", "5", "SWING"};
-    if (call.get_swing_mode().has_value()) {
-        ESP_LOGV(TAG, "control - requested swing mode is %s",
-                *call.get_swing_mode());
-
-        this->swing_mode = *call.get_swing_mode();
-        switch(*call.get_swing_mode()) {
-            case climate::CLIMATE_SWING_OFF:
-                hp->setVaneSetting("AUTO");
-                updated = true;
-                break;
-            case climate::CLIMATE_SWING_VERTICAL:
-                hp->setVaneSetting("SWING");
-                updated = true;
-                break;
-            default:
-                ESP_LOGW(TAG, "control - received unsupported swing mode request.");
-
-        }
-    }
-    ESP_LOGD(TAG, "control - Was HeatPump updated? %s", YESNO(updated));
+    ESP_LOGD(TAG, "control - Was IoT Esp device updated? %s", YESNO(updated));
 
     // send the update back to esphome:
     this->publish_state();
-    // and the heat pump:
-    hp->update();
 }
 
-void MitsubishiHeatPump::hpSettingsChanged() {
-    heatpumpSettings currentSettings = hp->getSettings();
-
-    if (currentSettings.power == NULL) {
-        /*
-         * We should always get a valid pointer here once the HeatPump
-         * component fully initializes. If HeatPump hasn't read the settings
-         * from the unit yet (hp->connect() doesn't do this, sadly), we'll need
-         * to punt on the update. Likely not an issue when run in callback
-         * mode, but that isn't working right yet.
-         */
-        ESP_LOGW(TAG, "Waiting for HeatPump to read the settings the first time.");
-        esphome::delay(10);
-        return;
-    }
-
-    /*
-     * ************ HANDLE POWER AND MODE CHANGES ***********
-     * https://github.com/geoffdavis/HeatPump/blob/stream/src/HeatPump.h#L125
-     * const char* POWER_MAP[2]       = {"OFF", "ON"};
-     * const char* MODE_MAP[5]        = {"HEAT", "DRY", "COOL", "FAN", "AUTO"};
-     */
-    if (strcmp(currentSettings.power, "ON") == 0) {
-        if (strcmp(currentSettings.mode, "HEAT") == 0) {
-            this->mode = climate::CLIMATE_MODE_HEAT;
-            if (heat_setpoint != currentSettings.temperature) {
-                heat_setpoint = currentSettings.temperature;
-                save(currentSettings.temperature, heat_storage);
-            }
-            this->action = climate::CLIMATE_ACTION_IDLE;
-        } else if (strcmp(currentSettings.mode, "DRY") == 0) {
-            this->mode = climate::CLIMATE_MODE_DRY;
-            this->action = climate::CLIMATE_ACTION_DRYING;
-        } else if (strcmp(currentSettings.mode, "COOL") == 0) {
-            this->mode = climate::CLIMATE_MODE_COOL;
-            if (cool_setpoint != currentSettings.temperature) {
-                cool_setpoint = currentSettings.temperature;
-                save(currentSettings.temperature, cool_storage);
-            }
-            this->action = climate::CLIMATE_ACTION_IDLE;
-        } else if (strcmp(currentSettings.mode, "FAN") == 0) {
-            this->mode = climate::CLIMATE_MODE_FAN_ONLY;
-            this->action = climate::CLIMATE_ACTION_FAN;
-        } else if (strcmp(currentSettings.mode, "AUTO") == 0) {
-            this->mode = climate::CLIMATE_MODE_HEAT_COOL;
-            if (auto_setpoint != currentSettings.temperature) {
-                auto_setpoint = currentSettings.temperature;
-                save(currentSettings.temperature, auto_storage);
-            }
-            this->action = climate::CLIMATE_ACTION_IDLE;
-        } else {
-            ESP_LOGW(
-                    TAG,
-                    "Unknown climate mode value %s received from HeatPump",
-                    currentSettings.mode
-            );
-        }
-    } else {
-        this->mode = climate::CLIMATE_MODE_OFF;
-        this->action = climate::CLIMATE_ACTION_OFF;
-    }
-
-    ESP_LOGI(TAG, "Climate mode is: %i", this->mode);
-
-    /*
-     * ******* HANDLE FAN CHANGES ********
-     *
-     * const char* FAN_MAP[6]         = {"AUTO", "QUIET", "1", "2", "3", "4"};
-     */
-    if (strcmp(currentSettings.fan, "QUIET") == 0) {
-        this->fan_mode = climate::CLIMATE_FAN_DIFFUSE;
-    } else if (strcmp(currentSettings.fan, "1") == 0) {
-            this->fan_mode = climate::CLIMATE_FAN_LOW;
-    } else if (strcmp(currentSettings.fan, "2") == 0) {
-            this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
-    } else if (strcmp(currentSettings.fan, "3") == 0) {
-            this->fan_mode = climate::CLIMATE_FAN_MIDDLE;
-    } else if (strcmp(currentSettings.fan, "4") == 0) {
-            this->fan_mode = climate::CLIMATE_FAN_HIGH;
-    } else { //case "AUTO" or default:
-        this->fan_mode = climate::CLIMATE_FAN_AUTO;
-    }
-    ESP_LOGI(TAG, "Fan mode is: %i", this->fan_mode);
-
-    /* ******** HANDLE MITSUBISHI VANE CHANGES ********
-     * const char* VANE_MAP[7]        = {"AUTO", "1", "2", "3", "4", "5", "SWING"};
-     */
-    if (strcmp(currentSettings.vane, "SWING") == 0) {
-        this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
-    }
-    else {
-        this->swing_mode = climate::CLIMATE_SWING_OFF;
-    }
-    ESP_LOGI(TAG, "Swing mode is: %i", this->swing_mode);
-
-
-
-    /*
-     * ******** HANDLE TARGET TEMPERATURE CHANGES ********
-     */
-    this->target_temperature = currentSettings.temperature;
-    ESP_LOGI(TAG, "Target temp is: %f", this->target_temperature);
-
-    /*
-     * ******** Publish state back to ESPHome. ********
-     */
-    this->publish_state();
-}
-
-/**
- * Report changes in the current temperature sensed by the HeatPump.
- */
-void MitsubishiHeatPump::hpStatusChanged(heatpumpStatus currentStatus) {
-    this->current_temperature = currentStatus.roomTemperature;
-    switch (this->mode) {
-        case climate::CLIMATE_MODE_HEAT:
-            if (currentStatus.operating) {
-                this->action = climate::CLIMATE_ACTION_HEATING;
-            }
-            else {
-                this->action = climate::CLIMATE_ACTION_IDLE;
-            }
-            break;
-        case climate::CLIMATE_MODE_COOL:
-            if (currentStatus.operating) {
-                this->action = climate::CLIMATE_ACTION_COOLING;
-            }
-            else {
-                this->action = climate::CLIMATE_ACTION_IDLE;
-            }
-            break;
-        case climate::CLIMATE_MODE_HEAT_COOL:
-            this->action = climate::CLIMATE_ACTION_IDLE;
-            if (currentStatus.operating) {
-              if (this->current_temperature > this->target_temperature) {
-                  this->action = climate::CLIMATE_ACTION_COOLING;
-              } else if (this->current_temperature < this->target_temperature) {
-                  this->action = climate::CLIMATE_ACTION_HEATING;
-              }
-            }
-            break;
-        case climate::CLIMATE_MODE_DRY:
-            if (currentStatus.operating) {
-                this->action = climate::CLIMATE_ACTION_DRYING;
-            }
-            else {
-                this->action = climate::CLIMATE_ACTION_IDLE;
-            }
-            break;
-        case climate::CLIMATE_MODE_FAN_ONLY:
-            this->action = climate::CLIMATE_ACTION_FAN;
-            break;
-        default:
-            this->action = climate::CLIMATE_ACTION_OFF;
-    }
-
-    this->publish_state();
-}
-
-void MitsubishiHeatPump::set_remote_temperature(float temp) {
-    ESP_LOGD(TAG, "Setting remote temp: %.1f", temp);
-    this->hp->setRemoteTemperature(temp);
-}
-
-void MitsubishiHeatPump::setup() {
+void GCPIoTEsp::setup() {
     // This will be called by App.setup()
     this->banner();
-    ESP_LOGCONFIG(TAG, "Setting up UART...");
-    if (!this->get_hw_serial_()) {
-        ESP_LOGCONFIG(
-                TAG,
-                "No HardwareSerial was provided. "
-                "Software serial ports are unsupported by this component."
-        );
-        this->mark_failed();
-        return;
-    }
-    this->check_logger_conflict_();
 
-    ESP_LOGCONFIG(TAG, "Intializing new HeatPump object.");
+    ESP_LOGCONFIG(TAG, "Intializing new IoT Core connection object.");
     this->hp = new HeatPump();
     this->current_temperature = NAN;
     this->target_temperature = NAN;
@@ -476,25 +149,7 @@ void MitsubishiHeatPump::setup() {
     this->dump_config();
 }
 
-/**
- * The ESP only has a few bytes of rtc storage, so instead
- * of storing floats directly, we'll store the number of
- * TEMPERATURE_STEPs from MIN_TEMPERATURE.
- **/
-void MitsubishiHeatPump::save(float value, ESPPreferenceObject& storage) {
-    uint8_t steps = (value - ESPMHP_MIN_TEMPERATURE) / ESPMHP_TEMPERATURE_STEP;
-    storage.save(&steps);
-}
-
-optional<float> MitsubishiHeatPump::load(ESPPreferenceObject& storage) {
-    uint8_t steps = 0;
-    if (!storage.load(&steps)) {
-        return {};
-    }
-    return ESPMHP_MIN_TEMPERATURE + (steps * ESPMHP_TEMPERATURE_STEP);
-}
-
-void MitsubishiHeatPump::dump_config() {
+void GCPIoTEsp::dump_config() {
     this->banner();
     ESP_LOGI(TAG, "  Supports HEAT: %s", YESNO(true));
     ESP_LOGI(TAG, "  Supports COOL: %s", YESNO(true));
@@ -504,7 +159,136 @@ void MitsubishiHeatPump::dump_config() {
     ESP_LOGI(TAG, "  Saved auto: %.1f", auto_setpoint.value_or(-1));
 }
 
-void MitsubishiHeatPump::dump_state() {
-    LOG_CLIMATE("", "MitsubishiHeatPump Climate", this);
+void GCPIoTEsp::dump_state() {
     ESP_LOGI(TAG, "HELLO");
+}
+
+// !!REPLACEME!!
+// The MQTT callback function for commands and configuration updates
+// Place your message handler code here.
+void messageReceivedAdvanced(MQTTClient *client, char topic[], char bytes[], int length)
+{
+  ESP_LOGI(TAG, " Incoming Topic: %s", topic);
+  if (length > 0)// On message
+  {
+    ESP_LOGI(TAG, " \n\r   Data: %s", bytes);
+  }
+}
+///////////////////////////////
+
+// Initialize WiFi and MQTT for this board
+static MQTTClient *mqttClient;
+static BearSSL::WiFiClientSecure netClient;
+static BearSSL::X509List certList;
+static CloudIoTCoreDevice device(project_id, location, registry_id, device_id);
+CloudIoTCoreMqtt *mqtt;
+
+///////////////////////////////
+// Helpers specific to this board
+///////////////////////////////
+String getDefaultSensor()
+{
+  return "Wifi: " + String(WiFi.RSSI()) + "db";
+}
+
+String getJwt()
+{
+  // Disable software watchdog as these operations can take a while.
+  ESP.wdtDisable();
+  time_t iat = time(nullptr);
+  ESP_LOGI(TAG, "Refreshing JWT");
+  String jwt = device.createJWT(iat, jwt_exp_secs);
+  ESP.wdtEnable(0);
+  return jwt;
+}
+
+static void readDerCert(const char *filename) {
+  File ca = SPIFFS.open(filename, "r");
+  if (ca)
+  {
+    size_t size = ca.size();
+    uint8_t cert[size];
+    ca.read(cert, size);
+    certList.append(cert, size);
+    ca.close();
+
+    ESP_LOGI(TAG, " Success to open ca file ");
+  }
+  else
+  {
+    ESP_LOGE(TAG, " Failed to open ca file ");
+  }
+  ESP_LOGI(TAG, " Filename: %s", filename);
+}
+
+static void setupCertAndPrivateKey()
+{
+  // Set CA cert on wifi client
+  // If using a static (pem) cert, uncomment in ciotc_config.h:
+  certList.append(primary_ca);
+  certList.append(backup_ca);
+  netClient.setTrustAnchors(&certList);
+
+  device.setPrivateKey(private_key);
+  return;
+
+  // If using the (preferred) method with the cert and private key in /data (SPIFFS)
+  // To get the private key run
+  // openssl ec -in <private-key.pem> -outform DER -out private-key.der
+
+  if (!SPIFFS.begin())
+  {
+    ESP_LOGE(TAG, " Failed to mount file system");
+    return;
+  }
+
+  readDerCert("/gtsltsr.crt"); // primary_ca.pem
+  readDerCert("/GSR4.crt"); // backup_ca.pem
+  netClient.setTrustAnchors(&certList);
+
+
+  File f = SPIFFS.open("/private-key.der", "r");
+  if (f) {
+    size_t size = f.size();
+    uint8_t data[size];
+    f.read(data, size);
+    f.close();
+
+    BearSSL::PrivateKey pk(data, size);
+    device.setPrivateKey(pk.getEC()->x);
+
+    ESP_LOGI(TAG, " Success to open private-key.der");
+  } else {
+    ESP_LOGE(TAG, " Failed to open private-key.der");
+  }
+
+  SPIFFS.end();
+}
+
+///////////////////////////////
+// Orchestrates various methods from preceeding code.
+///////////////////////////////
+bool publishTelemetry(const String &data)
+{
+  ESP_LOGI(TAG, " Outcoming: %s", data);
+  return mqtt->publishTelemetry(data);
+}
+
+bool publishTelemetry(const char *data, int length)
+{
+  return mqtt->publishTelemetry(data, length);
+}
+
+// TODO: fix globals
+void setupCloudIoT()
+{
+
+  // ESP8266 WiFi secure initialization and device private key
+  setupCertAndPrivateKey();
+
+  mqttClient = new MQTTClient(512);
+  mqttClient->setOptions(180, true, 1000); // keepAlive, cleanSession, timeout
+  mqtt = new CloudIoTCoreMqtt(mqttClient, &netClient, &device);
+  mqtt->setUseLts(true);
+  mqtt->startMQTTAdvanced(); // Opens connection using advanced callback
 }
